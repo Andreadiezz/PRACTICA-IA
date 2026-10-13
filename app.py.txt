@@ -1,0 +1,585 @@
+
+import streamlit as st
+import pandas as pd
+import numpy as np
+import plotly.express as px
+from sklearn.ensemble import IsolationForest
+
+# --------------------------------------------------
+# 1. CONFIGURACIÓN DE LA APLICACIÓN
+# --------------------------------------------------
+
+st.set_page_config(
+    page_title="Absentismo Analytics",
+    page_icon="📊",
+    layout="wide"
+)
+
+st.title("📊 Absentismo Analytics")
+st.write(
+    "Aplicación de apoyo a Recursos Humanos para analizar "
+    "el absentismo laboral y detectar patrones inusuales."
+)
+
+
+# --------------------------------------------------
+# 2. GENERACIÓN DE DATOS FICTICIOS
+# --------------------------------------------------
+
+@st.cache_data
+def generar_datos():
+    rng = np.random.default_rng(42)
+
+    departamentos = [
+        "Administración",
+        "Producción",
+        "Ventas",
+        "Logística",
+        "Recursos Humanos"
+    ]
+
+    filas = []
+
+    fechas = pd.date_range(
+        start="2025-01-01",
+        end="2025-12-31",
+        freq="D"
+    )
+
+    for fecha in fechas:
+        for departamento in departamentos:
+            numero = rng.poisson(0.25)
+
+            for _ in range(numero):
+                filas.append({
+                    "fecha": fecha,
+                    "duracion": int(
+                        rng.choice([2, 4, 8, 16, 24])
+                    ),
+                    "departamento": departamento,
+                    "tipo_ausencia": rng.choice([
+                        "Enfermedad",
+                        "Permiso",
+                        "Asunto personal",
+                        "Otro"
+                    ])
+                })
+
+    datos = pd.DataFrame(filas)
+
+    # Añadimos algunos registros ficticios inusuales.
+    extras = pd.DataFrame([
+        {
+            "fecha": pd.Timestamp("2025-06-15"),
+            "duracion": 80,
+            "departamento": "Producción",
+            "tipo_ausencia": "Otro"
+        },
+        {
+            "fecha": pd.Timestamp("2025-06-16"),
+            "duracion": 64,
+            "departamento": "Producción",
+            "tipo_ausencia": "Otro"
+        },
+        {
+            "fecha": pd.Timestamp("2025-10-10"),
+            "duracion": 72,
+            "departamento": "Logística",
+            "tipo_ausencia": "Otro"
+        }
+    ])
+
+    return pd.concat(
+        [datos, extras],
+        ignore_index=True
+    )
+
+
+# --------------------------------------------------
+# 3. CARGA DE DATOS
+# --------------------------------------------------
+
+st.sidebar.header("Configuración")
+
+opcion = st.sidebar.radio(
+    "Selecciona el origen de los datos:",
+    [
+        "Utilizar datos ficticios",
+        "Cargar archivo CSV o Excel"
+    ]
+)
+
+archivo = None
+
+if opcion == "Cargar archivo CSV o Excel":
+    archivo = st.sidebar.file_uploader(
+        "Selecciona un archivo",
+        type=["csv", "xlsx"]
+    )
+
+if opcion == "Utilizar datos ficticios":
+    datos_originales = generar_datos()
+
+elif archivo is not None:
+    try:
+        if archivo.name.endswith(".csv"):
+            try:
+                datos_originales = pd.read_csv(archivo)
+            except UnicodeDecodeError:
+                archivo.seek(0)
+                datos_originales = pd.read_csv(
+                    archivo,
+                    encoding="latin-1"
+                )
+        else:
+            datos_originales = pd.read_excel(archivo)
+
+    except Exception:
+        st.error(
+            "No se ha podido leer el archivo. "
+            "Comprueba que el formato sea correcto."
+        )
+        st.stop()
+
+else:
+    st.info(
+        "Carga un archivo CSV o Excel, o selecciona "
+        "los datos ficticios en el menú lateral."
+    )
+    st.stop()
+
+
+# --------------------------------------------------
+# 4. VALIDACIÓN Y LIMPIEZA
+# --------------------------------------------------
+
+datos = datos_originales.copy()
+
+datos.columns = [
+    str(col).strip().lower().replace(" ", "_")
+    for col in datos.columns
+]
+
+equivalencias = {
+    "fecha_ausencia": "fecha",
+    "date": "fecha",
+    "duration": "duracion",
+    "duracion_horas": "duracion",
+    "duracion_dias": "duracion",
+    "horas": "duracion",
+    "dias": "duracion",
+    "department": "departamento",
+    "area": "departamento",
+    "tipo": "tipo_ausencia",
+    "tipo_de_ausencia": "tipo_ausencia"
+}
+
+datos.rename(
+    columns=equivalencias,
+    inplace=True
+)
+
+obligatorias = [
+    "fecha",
+    "duracion",
+    "departamento"
+]
+
+faltantes = [
+    col for col in obligatorias
+    if col not in datos.columns
+]
+
+if faltantes:
+    st.error(
+        "Faltan columnas obligatorias: "
+        + ", ".join(faltantes)
+        + ". Se necesitan fecha, duracion y departamento."
+    )
+    st.stop()
+
+filas_iniciales = len(datos)
+
+datos["fecha"] = pd.to_datetime(
+    datos["fecha"],
+    errors="coerce"
+)
+
+datos["duracion"] = pd.to_numeric(
+    datos["duracion"],
+    errors="coerce"
+)
+
+datos["departamento"] = (
+    datos["departamento"]
+    .astype("string")
+    .str.strip()
+)
+
+if "tipo_ausencia" not in datos.columns:
+    datos["tipo_ausencia"] = "No especificado"
+
+datos["tipo_ausencia"] = (
+    datos["tipo_ausencia"]
+    .fillna("No especificado")
+    .astype(str)
+    .str.strip()
+    .replace("", "No especificado")
+)
+
+duplicados = int(datos.duplicated().sum())
+datos = datos.drop_duplicates()
+
+invalidos = (
+    datos["fecha"].isna()
+    | datos["duracion"].isna()
+    | (datos["duracion"] <= 0)
+    | datos["departamento"].isna()
+    | (datos["departamento"] == "")
+)
+
+filas_excluidas = int(invalidos.sum())
+datos = datos.loc[~invalidos].copy()
+
+if datos.empty:
+    st.error(
+        "No quedan registros válidos para analizar."
+    )
+    st.stop()
+
+
+# --------------------------------------------------
+# 5. CALIDAD DE LOS DATOS
+# --------------------------------------------------
+
+st.subheader("Calidad de los datos")
+
+c1, c2, c3 = st.columns(3)
+
+c1.metric("Filas recibidas", filas_iniciales)
+c2.metric("Registros válidos", len(datos))
+c3.metric("Filas excluidas", filas_excluidas)
+
+with st.expander("Consultar datos preparados"):
+    st.dataframe(
+        datos.head(100),
+        use_container_width=True
+    )
+
+st.caption(
+    f"Se han eliminado {duplicados} registros duplicados. "
+    "Las filas inválidas se excluyen del análisis."
+)
+
+
+# --------------------------------------------------
+# 6. FILTROS
+# --------------------------------------------------
+
+st.subheader("Filtros de análisis")
+
+departamentos_disponibles = sorted(
+    datos["departamento"].unique().tolist()
+)
+
+seleccionados = st.multiselect(
+    "Departamentos",
+    departamentos_disponibles,
+    default=departamentos_disponibles
+)
+
+fecha_min = datos["fecha"].min().date()
+fecha_max = datos["fecha"].max().date()
+
+rango_fechas = st.date_input(
+    "Periodo de análisis",
+    value=(fecha_min, fecha_max),
+    min_value=fecha_min,
+    max_value=fecha_max
+)
+
+if not seleccionados:
+    st.warning("Selecciona al menos un departamento.")
+    st.stop()
+
+if not isinstance(rango_fechas, (tuple, list)) or len(rango_fechas) != 2:
+    st.info("Selecciona una fecha de inicio y una fecha de fin.")
+    st.stop()
+
+inicio, fin = rango_fechas
+
+if inicio > fin:
+    st.error("La fecha inicial no puede ser posterior a la final.")
+    st.stop()
+
+filtrados = datos[
+    (datos["departamento"].isin(seleccionados))
+    & (datos["fecha"].dt.date >= inicio)
+    & (datos["fecha"].dt.date <= fin)
+].copy()
+
+if filtrados.empty:
+    st.warning("No hay datos para los filtros seleccionados.")
+    st.stop()
+
+
+# --------------------------------------------------
+# 7. INDICADORES PRINCIPALES
+# --------------------------------------------------
+
+st.subheader("Indicadores de absentismo")
+
+total_ausencias = len(filtrados)
+duracion_total = filtrados["duracion"].sum()
+duracion_media = filtrados["duracion"].mean()
+numero_departamentos = filtrados["departamento"].nunique()
+
+c1, c2, c3, c4 = st.columns(4)
+
+c1.metric("Número de ausencias", total_ausencias)
+c2.metric("Duración total", f"{duracion_total:,.1f}")
+c3.metric("Duración media", f"{duracion_media:,.1f}")
+c4.metric("Departamentos", numero_departamentos)
+
+st.caption(
+    "La duración se expresa en la unidad utilizada en el archivo. "
+    "No se calcula una tasa de absentismo porque no se dispone "
+    "necesariamente de las horas o jornadas de trabajo previstas."
+)
+
+
+# --------------------------------------------------
+# 8. ANÁLISIS ESTADÍSTICO Y GRÁFICOS
+# --------------------------------------------------
+
+st.subheader("Análisis estadístico")
+
+frecuencia = st.selectbox(
+    "Agrupar la evolución por:",
+    ["Mes", "Semana"]
+)
+
+if frecuencia == "Mes":
+    filtrados["periodo"] = (
+        filtrados["fecha"].dt.to_period("M").dt.start_time
+    )
+else:
+    filtrados["periodo"] = (
+        filtrados["fecha"].dt.to_period("W").dt.start_time
+    )
+
+evolucion = (
+    filtrados.groupby("periodo", as_index=False)
+    .agg(
+        numero_ausencias=("duracion", "size"),
+        duracion_total=("duracion", "sum")
+    )
+)
+
+fig_evolucion = px.line(
+    evolucion,
+    x="periodo",
+    y="numero_ausencias",
+    markers=True,
+    title="Evolución del número de ausencias",
+    labels={
+        "periodo": "Periodo",
+        "numero_ausencias": "Número de ausencias"
+    }
+)
+
+st.plotly_chart(
+    fig_evolucion,
+    use_container_width=True
+)
+
+por_departamento = (
+    filtrados.groupby("departamento", as_index=False)
+    .agg(
+        numero_ausencias=("duracion", "size"),
+        duracion_total=("duracion", "sum"),
+        duracion_media=("duracion", "mean")
+    )
+)
+
+col1, col2 = st.columns(2)
+
+with col1:
+    fig1 = px.bar(
+        por_departamento,
+        x="departamento",
+        y="numero_ausencias",
+        title="Ausencias por departamento",
+        labels={
+            "departamento": "Departamento",
+            "numero_ausencias": "Número de ausencias"
+        }
+    )
+
+    st.plotly_chart(fig1, use_container_width=True)
+
+with col2:
+    fig2 = px.bar(
+        por_departamento,
+        x="departamento",
+        y="duracion_total",
+        title="Duración total por departamento",
+        labels={
+            "departamento": "Departamento",
+            "duracion_total": "Duración total"
+        }
+    )
+
+    st.plotly_chart(fig2, use_container_width=True)
+
+
+# --------------------------------------------------
+# 9. DETECCIÓN DE ANOMALÍAS CON ISOLATION FOREST
+# --------------------------------------------------
+
+st.subheader("Detección de patrones inusuales")
+
+st.write(
+    "Isolation Forest identifica observaciones que se alejan "
+    "del patrón general de los datos agregados por periodo "
+    "y departamento."
+)
+
+porcentaje = st.slider(
+    "Porcentaje estimado de anomalías",
+    min_value=1,
+    max_value=15,
+    value=5
+)
+
+agregados = (
+    filtrados.groupby(
+        ["periodo", "departamento"],
+        as_index=False
+    )
+    .agg(
+        numero_ausencias=("duracion", "size"),
+        duracion_total=("duracion", "sum"),
+        duracion_media=("duracion", "mean")
+    )
+)
+
+caracteristicas = [
+    "numero_ausencias",
+    "duracion_total",
+    "duracion_media"
+]
+
+if len(agregados) < 10:
+    st.warning(
+        "Se necesitan al menos 10 combinaciones de periodo "
+        "y departamento para aplicar Isolation Forest."
+    )
+
+else:
+    X = agregados[caracteristicas].replace(
+        [np.inf, -np.inf],
+        np.nan
+    )
+
+    validas = X.notna().all(axis=1)
+
+    if validas.sum() < 10 or X.loc[validas].nunique().max() <= 1:
+        st.warning(
+            "No hay suficientes datos válidos o variabilidad "
+            "para detectar patrones inusuales."
+        )
+
+    else:
+        modelo = IsolationForest(
+            n_estimators=150,
+            contamination=porcentaje / 100,
+            random_state=42
+        )
+
+        modelo.fit(X.loc[validas])
+
+        agregados["resultado"] = "No evaluado"
+        agregados["puntuacion"] = np.nan
+
+        predicciones = modelo.predict(X.loc[validas])
+        puntuaciones = modelo.decision_function(X.loc[validas])
+
+        agregados.loc[validas, "resultado"] = np.where(
+            predicciones == -1,
+            "Patrón inusual",
+            "Patrón habitual"
+        )
+
+        agregados.loc[validas, "puntuacion"] = puntuaciones
+
+        alertas = agregados[
+            agregados["resultado"] == "Patrón inusual"
+        ].copy()
+
+        st.metric(
+            "Observaciones con patrón inusual",
+            len(alertas)
+        )
+
+        if alertas.empty:
+            st.success(
+                "No se han detectado patrones inusuales "
+                "con los parámetros seleccionados."
+            )
+        else:
+            st.warning(
+                "Estas observaciones deben revisarse en su contexto. "
+                "Una anomalía no demuestra que exista una causa concreta."
+            )
+
+            st.dataframe(
+                alertas.sort_values("puntuacion")[
+                    [
+                        "periodo",
+                        "departamento",
+                        "numero_ausencias",
+                        "duracion_total",
+                        "duracion_media",
+                        "resultado"
+                    ]
+                ],
+                use_container_width=True
+            )
+
+        with st.expander("Consultar todas las observaciones"):
+            st.dataframe(
+                agregados,
+                use_container_width=True
+            )
+
+        # --------------------------------------------------
+        # 10. DESCARGA DE RESULTADOS
+        # --------------------------------------------------
+
+        st.subheader("Descargar resultados")
+
+        archivo_resultados = agregados.to_csv(
+            index=False
+        ).encode("utf-8-sig")
+
+        st.download_button(
+            label="Descargar resultados en CSV",
+            data=archivo_resultados,
+            file_name="resultados_absentismo.csv",
+            mime="text/csv"
+        )
+
+
+# --------------------------------------------------
+# 11. NOTA FINAL
+# --------------------------------------------------
+
+st.divider()
+
+st.caption(
+    "Herramienta de apoyo al análisis de Recursos Humanos. "
+    "Las anomalías son señales estadísticas, no explicaciones "
+    "de las ausencias ni evaluaciones individuales de empleados. "
+    "Utiliza datos ficticios o anonimizados."
+)
