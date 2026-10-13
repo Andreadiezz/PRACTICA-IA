@@ -4,6 +4,7 @@ import pandas as pd
 import numpy as np
 import plotly.express as px
 from sklearn.ensemble import IsolationForest
+st.write("LA APLICACIÓN SE ESTÁ EJECUTANDO")
 
 # --------------------------------------------------
 # 1. CONFIGURACIÓN DE LA APLICACIÓN
